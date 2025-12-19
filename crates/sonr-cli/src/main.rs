@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "sonr",
     author = "fox",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Semantic grep for your codebase",
     long_about = "sonr is a high-performance semantic search tool that understands your code.
 It uses local LLM embeddings and reranking to find relevant snippets based on meaning rather than just keywords.

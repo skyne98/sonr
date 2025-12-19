@@ -27,7 +27,7 @@ use tracing::{error, info};
 #[command(
     name = "sonr-daemon",
     author = "fox",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Background inference engine for sonr",
     long_about = "sonr-daemon manages local LLM instances for embedding and reranking.
 It automatically downloads models from Hugging Face and provides a REST API for the sonr CLI.

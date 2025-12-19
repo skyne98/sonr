@@ -1,9 +1,12 @@
 {
-  description = "sonr - semantic search tool for local codebases";
+  description = "sonr - high-performance semantic search tool for local codebases";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -20,20 +23,28 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
-          config.allowUnfree = true;
         };
 
-        rust = pkgs.rust-bin.stable.latest.default;
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
+        };
 
         commonArgs = {
           src = ./.;
+          # This requires Cargo.lock to be present in the repository
           cargoLock.lockFile = ./Cargo.lock;
+
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ];
-          doCheck = false; # Tests require llama-server and network access
+
+          # Tests require llama-server and network access for models
+          doCheck = false;
         };
 
-        sonr-daemon = pkgs.rustPlatform.buildRustPackage (
+        sonr-daemon = rustPlatform.buildRustPackage (
           commonArgs
           // {
             pname = "sonr-daemon";
@@ -42,7 +53,7 @@
           }
         );
 
-        sonr-cli = pkgs.rustPlatform.buildRustPackage (
+        sonr-cli = rustPlatform.buildRustPackage (
           commonArgs
           // {
             pname = "sonr-cli";
@@ -50,7 +61,6 @@
             buildAndTestSubdir = "crates/sonr-cli";
           }
         );
-
       in
       {
         packages = {
@@ -61,6 +71,10 @@
               sonr-daemon
               sonr-cli
             ];
+            postBuild = ''
+              # Create a symlink for convenience if users expect 'sonr' command
+              ln -s ${sonr-cli}/bin/sonr-cli $out/bin/sonr
+            '';
           };
         };
 
@@ -72,7 +86,7 @@
 
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
-            rust
+            rustToolchain
             pkgs.pkg-config
           ];
           buildInputs = [
@@ -80,8 +94,8 @@
             pkgs.llama-cpp
           ];
           shellHook = ''
-            echo "sonr development environment"
-            echo "llama-server version: $(llama-server --version 2>/dev/null || echo 'not found')"
+            echo "Welcome to the sonr development environment"
+            echo "llama-server: $(llama-server --version 2>/dev/null || echo 'not found in PATH')"
           '';
         };
       }

@@ -495,10 +495,7 @@ async fn semantic_search(
     let semaphore = Arc::new(Semaphore::new(32)); // Limit concurrent embedding requests
 
     for root in payload.paths {
-        let walker = WalkBuilder::new(root)
-            .hidden(false)
-            .git_ignore(true)
-            .build();
+        let walker = WalkBuilder::new(root).hidden(true).git_ignore(true).build();
 
         for result in walker {
             if let Ok(entry) = result {

@@ -53,7 +53,7 @@
           }
         );
 
-        sonr-cli = rustPlatform.buildRustPackage (
+        sonr = rustPlatform.buildRustPackage (
           commonArgs
           // {
             pname = "sonr-cli";

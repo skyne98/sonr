@@ -1,7 +1,11 @@
 [package]
-name = "sonr-cli"
+name = "sonr"
 version = "0.1.0"
 edition = "2024"
+description = "High-performance semantic search tool for local codebases"
+license = "MIT"
+repository = "https://github.com/skyne98/sonr"
+homepage = "https://github.com/skyne98/sonr"
 
 [dependencies]
 clap = { workspace = true }

@@ -2,6 +2,10 @@
 name = "sonr-daemon"
 version = "0.1.0"
 edition = "2024"
+description = "Background daemon for sonr, providing semantic search capabilities using local LLMs"
+license = "MIT"
+repository = "https://github.com/skyne98/sonr"
+homepage = "https://github.com/skyne98/sonr"
 
 [dependencies]
 tokio = { workspace = true }

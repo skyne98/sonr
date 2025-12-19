@@ -2,6 +2,7 @@
 name = "sonr"
 version = "0.1.0"
 edition = "2024"
+readme = "../../README.md"
 description = "High-performance semantic search tool for local codebases"
 license = "MIT"
 repository = "https://github.com/skyne98/sonr"

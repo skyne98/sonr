@@ -33,7 +33,7 @@ cargo build --release
 ### 1. Start the Daemon
 
 ```bash
-./target/release/sonr-daemon --cache-file ./embeddings.json
+./target/release/sonr-daemon
 ```
 
 The daemon will download the default models (Qwen3-0.6B based) and start listening on port 3000.

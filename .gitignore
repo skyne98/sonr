@@ -1,0 +1,26 @@
+# Rust
+/target
+Cargo.lock
+
+# Logs
+*.log
+daemon.log
+daemon_test.log
+daemon_final.log
+daemon_embed_fix.log
+daemon_final_test.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+test.txt
+*.gguf
+lm_notes/

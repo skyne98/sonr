@@ -1,6 +1,6 @@
 [package]
 name = "sonr"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 readme = "../../README.md"
 description = "High-performance semantic search tool for local codebases"

@@ -36,7 +36,7 @@ cargo build --release
 ./target/release/sonr-daemon
 ```
 
-The daemon will download the default models (Qwen3-0.6B based) and start listening on port 3000.
+The daemon will download the default models (Qwen3-0.6B based) and start listening on an available port. It writes this port to a discovery file so the CLI can find it automatically.
 
 ### 2. Search via CLI
 
@@ -49,12 +49,14 @@ The daemon will download the default models (Qwen3-0.6B based) and start listeni
 - `sonr <query> [paths...]`: Search for `<query>` in the specified paths.
 - `--limit <N>`: Number of results to return (default: 10).
 - `--json`: Output results in JSON format.
-- `--url <URL>`: Connect to a custom daemon URL (default: `http://localhost:3000`).
+- `--url <URL>`: Connect to a custom daemon URL (overrides automatic discovery).
+- `--port-file <PATH>`: Path to the daemon's port discovery file.
 
 ## Configuration
 
 The daemon supports several flags:
-- `--port`: API port (default: 3000).
+- `--port`: API port (default: 3000). Use `0` for OS-assigned port.
+- `--port-file`: Path to write the assigned port for CLI discovery.
 - `--embedding-hf-repo`: HF repository for the embedding model.
 - `--reranker-hf-repo`: HF repository for the reranker model.
 - `--gpu-layers`: Number of layers to offload to GPU (default: 99).

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use directories::ProjectDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -65,10 +66,13 @@ struct Args {
     #[arg(
         long,
         env = "SONR_URL",
-        default_value = "http://localhost:3000",
-        help = "The address of the running sonr-daemon"
+        help = "The address of the running sonr-daemon (overrides port file discovery)"
     )]
-    url: String,
+    url: Option<String>,
+
+    /// Path to the daemon's port file
+    #[arg(long, help = "Path to the daemon's port file for automatic discovery")]
+    port_file: Option<PathBuf>,
 
     /// Output raw JSON instead of formatted text
     #[arg(long, help = "Format output as JSON for machine consumption")]
@@ -96,6 +100,31 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let client = Client::new();
 
+    let base_url = if let Some(url) = args.url {
+        url
+    } else {
+        let port_file = args.port_file.or_else(|| {
+            ProjectDirs::from("com", "sonr", "sonr").map(|proj_dirs| {
+                proj_dirs
+                    .runtime_dir()
+                    .unwrap_or_else(|| proj_dirs.cache_dir())
+                    .join("daemon.port")
+            })
+        });
+
+        let mut discovered_url = "http://localhost:3000".to_string();
+        if let Some(path) = port_file {
+            if path.exists() {
+                if let Ok(port_str) = std::fs::read_to_string(&path) {
+                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                        discovered_url = format!("http://127.0.0.1:{}", port);
+                    }
+                }
+            }
+        }
+        discovered_url
+    };
+
     // Canonicalize paths to ensure the daemon can find them if they are local
     let mut absolute_paths = Vec::new();
     for path in args.paths {
@@ -113,7 +142,7 @@ async fn main() -> Result<()> {
         limit: Some(args.limit),
     };
 
-    let url = format!("{}/search", args.url.trim_end_matches('/'));
+    let url = format!("{}/search", base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
         .json(&request)

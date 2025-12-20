@@ -51,9 +51,16 @@ struct Args {
     #[arg(
         long,
         default_value = "3000",
-        help = "The port the daemon API will listen on"
+        help = "The port the daemon API will listen on. Use 0 for OS-assigned port."
     )]
     port: u16,
+
+    /// Path to a file where the daemon will write its port number
+    #[arg(
+        long,
+        help = "Path to a file where the daemon will write its port number"
+    )]
+    port_file: Option<PathBuf>,
 
     /// Hugging Face repo for the embedding model
     #[arg(
@@ -241,10 +248,12 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    let proj_dirs = ProjectDirs::from("com", "sonr", "sonr");
+
     let cache_file = if let Some(path) = args.cache_file {
         Some(path)
     } else {
-        ProjectDirs::from("com", "sonr", "sonr").map(|proj_dirs| {
+        proj_dirs.as_ref().map(|proj_dirs| {
             let cache_dir = proj_dirs.cache_dir();
             let _ = std::fs::create_dir_all(cache_dir);
             cache_dir.join("embeddings.json")
@@ -302,12 +311,38 @@ async fn main() -> Result<()> {
         .route("/search", post(semantic_search))
         .with_state(state.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    info!("sonr-daemon listening on {}", addr);
-
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!("sonr-daemon listening on {}", local_addr);
+
+    let port_file = if let Some(path) = args.port_file {
+        Some(path)
+    } else {
+        proj_dirs.as_ref().map(|proj_dirs| {
+            let run_dir = proj_dirs
+                .runtime_dir()
+                .unwrap_or_else(|| proj_dirs.cache_dir());
+            let _ = std::fs::create_dir_all(run_dir);
+            run_dir.join("daemon.port")
+        })
+    };
+
+    if let Some(ref path) = port_file {
+        if let Err(e) = std::fs::write(path, local_addr.port().to_string()) {
+            error!("Failed to write port file {:?}: {}", path, e);
+        } else {
+            info!("Port written to {:?}", path);
+        }
+    }
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(path) = port_file {
+                let _ = std::fs::remove_file(path);
+            }
+        })
         .await?;
 
     // Final save on shutdown

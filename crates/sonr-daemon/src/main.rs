@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Json as AxumJson, Router,
     extract::State,
     http::StatusCode,
     routing::{get, post},
@@ -10,6 +10,16 @@ use directories::ProjectDirs;
 use ignore::WalkBuilder;
 use memvdb::{CacheDB, Distance, Embedding};
 use reqwest::Client;
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        session::local::LocalSessionManager,
+        tower::{StreamableHttpServerConfig, StreamableHttpService},
+    },
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -221,6 +231,62 @@ struct AppState {
     cache_dirty: Arc<AtomicBool>,
     cache_file: Option<PathBuf>,
     model_id: String,
+    tool_router: ToolRouter<Self>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+struct SemanticSearchToolRequest {
+    #[schemars(description = "The natural language query")]
+    query: String,
+    #[schemars(description = "The root directory to search in")]
+    root_directory: String,
+    #[schemars(description = "Maximum number of results to return")]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize, rmcp::schemars::JsonSchema)]
+struct SemanticSearchToolResponse {
+    #[schemars(description = "List of search results ordered by relevance")]
+    results: Vec<SearchResult>,
+}
+
+#[tool_router]
+impl AppState {
+    #[tool(description = "Search codebases using natural language semantic search")]
+    async fn semantic_search(
+        &self,
+        params: Parameters<SemanticSearchToolRequest>,
+    ) -> Result<rmcp::Json<SemanticSearchToolResponse>, McpError> {
+        let payload = params.0;
+        let req = SearchRequest {
+            query: payload.query,
+            paths: vec![PathBuf::from(payload.root_directory)],
+            limit: payload.limit,
+        };
+
+        match perform_semantic_search(self, req).await {
+            Ok(results) => Ok(rmcp::Json(SemanticSearchToolResponse { results })),
+            Err(e) => Err(McpError::new(ErrorCode(-32603), e.1, None)),
+        }
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for AppState {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "sonr-daemon".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                title: Some("sonr-daemon".into()),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some("Use this tool to find relevant code snippets in a codebase using semantic search. It is much more effective than grep for conceptual queries.".into()),
+        }
+    }
 }
 
 #[tokio::main]
@@ -280,6 +346,7 @@ async fn main() -> Result<()> {
         cache_dirty: Arc::new(AtomicBool::new(false)),
         cache_file,
         model_id: format!("{}:{}", args.embedding_hf_repo, args.embedding_hf_file),
+        tool_router: AppState::tool_router(),
     };
 
     // Background cache saver
@@ -306,9 +373,19 @@ async fn main() -> Result<()> {
         });
     }
 
+    let mcp_service = StreamableHttpService::new(
+        {
+            let state = state.clone();
+            move || Ok(state.clone())
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/search", post(semantic_search))
+        .route("/search", post(semantic_search_handler))
+        .nest_service("/mcp", mcp_service)
         .with_state(state.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -394,7 +471,7 @@ struct SearchRequest {
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, rmcp::schemars::JsonSchema)]
 struct SearchResult {
     content: String,
     file: String,
@@ -511,11 +588,18 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<Chunk> {
     chunks
 }
 
-async fn semantic_search(
+async fn semantic_search_handler(
     State(state): State<AppState>,
-    Json(payload): Json<SearchRequest>,
-) -> Result<Json<Vec<SearchResult>>, (StatusCode, String)> {
-    let query_vec = get_embedding(&state, &payload.query).await?;
+    AxumJson(payload): AxumJson<SearchRequest>,
+) -> Result<AxumJson<Vec<SearchResult>>, (StatusCode, String)> {
+    perform_semantic_search(&state, payload).await.map(AxumJson)
+}
+
+async fn perform_semantic_search(
+    state: &AppState,
+    payload: SearchRequest,
+) -> Result<Vec<SearchResult>, (StatusCode, String)> {
+    let query_vec = get_embedding(state, &payload.query).await?;
 
     let mut db = CacheDB::new();
     let collection_name = "temp_search";
@@ -593,7 +677,7 @@ async fn semantic_search(
     let initial_results = collection.get_similarity(&query_vec, limit * 2);
 
     if initial_results.is_empty() {
-        return Ok(Json(vec![]));
+        return Ok(vec![]);
     }
 
     let mut docs_to_rerank = Vec::new();
@@ -646,7 +730,7 @@ async fn semantic_search(
                     score,
                 });
             }
-            return Ok(Json(final_results));
+            return Ok(final_results);
         }
     } else {
         let error_text = resp.text().await.unwrap_or_default();
@@ -673,7 +757,7 @@ async fn semantic_search(
         })
         .collect();
 
-    Ok(Json(final_results))
+    Ok(final_results)
 }
 
 #[cfg(test)]

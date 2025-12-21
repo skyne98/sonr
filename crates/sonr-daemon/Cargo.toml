@@ -1,6 +1,6 @@
 [package]
 name = "sonr-daemon"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 readme = "../../README.md"
 description = "Background daemon for sonr, providing semantic search capabilities using local LLMs"
@@ -12,6 +12,8 @@ homepage = "https://github.com/skyne98/sonr"
 tokio = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }

@@ -475,8 +475,8 @@ struct SearchRequest {
 struct SearchResult {
     content: String,
     file: String,
-    line_start: usize,
-    line_end: usize,
+    line_start: i64,
+    line_end: i64,
     score: f32,
 }
 
@@ -536,8 +536,8 @@ async fn get_embedding(state: &AppState, text: &str) -> Result<Vec<f32>, (Status
 
 struct Chunk {
     content: String,
-    line_start: usize,
-    line_end: usize,
+    line_start: i64,
+    line_end: i64,
 }
 
 fn chunk_text(text: &str, max_chars: usize) -> Vec<Chunk> {
@@ -581,8 +581,8 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<Chunk> {
 
         chunks.push(Chunk {
             content: current_chunk.trim().to_string(),
-            line_start: start_line,
-            line_end: last_non_empty + 1,
+            line_start: start_line as i64,
+            line_end: (last_non_empty + 1) as i64,
         });
     }
     chunks

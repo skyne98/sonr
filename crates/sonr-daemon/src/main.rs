@@ -29,7 +29,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, Command};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
@@ -123,10 +123,17 @@ struct Args {
     /// Number of GPU layers to offload
     #[arg(
         long,
-        default_value = "99",
-        help = "Number of model layers to offload to GPU (0 for CPU only)"
+        help = "Number of model layers to offload to GPU (leave unset to let llama.cpp auto-fit)"
     )]
-    gpu_layers: i32,
+    gpu_layers: Option<i32>,
+
+    /// Whether to enable llama.cpp auto-fit for device memory
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Pass --fit on to the internal llama-server instances"
+    )]
+    fit: bool,
 
     /// Path to the embedding cache file
     #[arg(
@@ -137,7 +144,7 @@ struct Args {
 }
 
 struct LlamaProcess {
-    _child: Child,
+    child: Child,
 }
 
 impl LlamaProcess {
@@ -146,8 +153,9 @@ impl LlamaProcess {
         hf_file: Option<&str>,
         port: u16,
         ctx_size: u32,
-        gpu_layers: i32,
+        gpu_layers: Option<i32>,
         is_reranker: bool,
+        fit: bool,
     ) -> Result<Self> {
         let mode_str = if is_reranker { "reranker" } else { "embedding" };
         info!("Starting llama-server for {} on port {}", mode_str, port);
@@ -165,9 +173,15 @@ impl LlamaProcess {
             .arg("--batch-size")
             .arg("2048")
             .arg("--ubatch-size")
-            .arg("512")
-            .arg("--n-gpu-layers")
-            .arg(gpu_layers.to_string());
+            .arg("512");
+
+        if let Some(gpu_layers) = gpu_layers {
+            cmd.arg("--n-gpu-layers").arg(gpu_layers.to_string());
+        }
+
+        if fit {
+            cmd.arg("--fit").arg("on");
+        }
 
         if is_reranker {
             cmd.arg("--reranking");
@@ -218,7 +232,132 @@ impl LlamaProcess {
             }
         }
 
-        Ok(Self { _child: child })
+        Ok(Self { child })
+    }
+
+    async fn terminate(mut self) {
+        if let Err(e) = self.child.start_kill() {
+            if e.kind() != std::io::ErrorKind::InvalidInput {
+                error!("Failed to signal llama-server termination: {}", e);
+            }
+        }
+
+        if let Err(e) = self.child.wait().await {
+            error!("Failed to wait for llama-server termination: {}", e);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LlamaRuntimeConfig {
+    embedding_hf_repo: String,
+    embedding_hf_file: String,
+    llama_port: u16,
+    reranker_hf_repo: String,
+    llama_reranker_port: u16,
+    ctx_size: u32,
+    gpu_layers: Option<i32>,
+    fit: bool,
+}
+
+struct LlamaRuntime {
+    config: LlamaRuntimeConfig,
+    embed_proc: Option<LlamaProcess>,
+    rerank_proc: Option<LlamaProcess>,
+    active_searches: usize,
+}
+
+impl LlamaRuntime {
+    fn new(config: LlamaRuntimeConfig) -> Self {
+        Self {
+            config,
+            embed_proc: None,
+            rerank_proc: None,
+            active_searches: 0,
+        }
+    }
+
+    async fn ensure_running(&mut self) -> Result<()> {
+        if self.embed_proc.is_some() && self.rerank_proc.is_some() {
+            return Ok(());
+        }
+
+        if let Some(proc) = self.rerank_proc.take() {
+            proc.terminate().await;
+        }
+        if let Some(proc) = self.embed_proc.take() {
+            proc.terminate().await;
+        }
+
+        info!("Starting llama-server helpers for semantic search");
+        let config = self.config.clone();
+        let embed_proc = LlamaProcess::spawn(
+            &config.embedding_hf_repo,
+            Some(&config.embedding_hf_file),
+            config.llama_port,
+            config.ctx_size,
+            config.gpu_layers,
+            false,
+            config.fit,
+        )
+        .await?;
+
+        let rerank_proc = match LlamaProcess::spawn(
+            &config.reranker_hf_repo,
+            None,
+            config.llama_reranker_port,
+            config.ctx_size,
+            config.gpu_layers,
+            true,
+            config.fit,
+        )
+        .await
+        {
+            Ok(proc) => proc,
+            Err(err) => {
+                embed_proc.terminate().await;
+                return Err(err);
+            }
+        };
+
+        self.embed_proc = Some(embed_proc);
+        self.rerank_proc = Some(rerank_proc);
+        Ok(())
+    }
+}
+
+struct LlamaRuntimeLease {
+    runtime: Arc<Mutex<LlamaRuntime>>,
+}
+
+impl LlamaRuntimeLease {
+    async fn release(self) {
+        let (embed_proc, rerank_proc, remaining_searches) = {
+            let mut runtime = self.runtime.lock().await;
+            runtime.active_searches = runtime.active_searches.saturating_sub(1);
+            let remaining_searches = runtime.active_searches;
+            if remaining_searches == 0 {
+                (
+                    runtime.embed_proc.take(),
+                    runtime.rerank_proc.take(),
+                    remaining_searches,
+                )
+            } else {
+                (None, None, remaining_searches)
+            }
+        };
+
+        if remaining_searches != 0 {
+            return;
+        }
+
+        info!("Stopping llama-server helpers after semantic search");
+        if let Some(proc) = rerank_proc {
+            proc.terminate().await;
+        }
+        if let Some(proc) = embed_proc {
+            proc.terminate().await;
+        }
     }
 }
 
@@ -227,6 +366,7 @@ struct AppState {
     client: Client,
     llama_embed_url: String,
     llama_rerank_url: String,
+    llama_runtime: Arc<Mutex<LlamaRuntime>>,
     embedding_cache: Arc<RwLock<HashMap<String, Vec<f32>>>>,
     cache_dirty: Arc<AtomicBool>,
     cache_file: Option<PathBuf>,
@@ -271,6 +411,20 @@ impl AppState {
     }
 }
 
+impl AppState {
+    async fn acquire_llama_runtime(&self) -> Result<LlamaRuntimeLease, (StatusCode, String)> {
+        let mut runtime = self.llama_runtime.lock().await;
+        runtime
+            .ensure_running()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        runtime.active_searches += 1;
+        Ok(LlamaRuntimeLease {
+            runtime: self.llama_runtime.clone(),
+        })
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for AppState {
     fn get_info(&self) -> ServerInfo {
@@ -293,26 +447,6 @@ impl ServerHandler for AppState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-
-    let _embed_proc = LlamaProcess::spawn(
-        &args.embedding_hf_repo,
-        Some(&args.embedding_hf_file),
-        args.llama_port,
-        args.ctx_size,
-        args.gpu_layers,
-        false,
-    )
-    .await?;
-
-    let _rerank_proc = LlamaProcess::spawn(
-        &args.reranker_hf_repo,
-        None,
-        args.llama_reranker_port,
-        args.ctx_size,
-        args.gpu_layers,
-        true,
-    )
-    .await?;
 
     let proj_dirs = ProjectDirs::from("com", "sonr", "sonr");
 
@@ -338,10 +472,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    let runtime_config = LlamaRuntimeConfig {
+        embedding_hf_repo: args.embedding_hf_repo.clone(),
+        embedding_hf_file: args.embedding_hf_file.clone(),
+        llama_port: args.llama_port,
+        reranker_hf_repo: args.reranker_hf_repo.clone(),
+        llama_reranker_port: args.llama_reranker_port,
+        ctx_size: args.ctx_size,
+        gpu_layers: args.gpu_layers,
+        fit: args.fit,
+    };
+
     let state = AppState {
         client: Client::new(),
-        llama_embed_url: format!("http://127.0.0.1:{}", args.llama_port),
-        llama_rerank_url: format!("http://127.0.0.1:{}", args.llama_reranker_port),
+        llama_embed_url: format!("http://127.0.0.1:{}", runtime_config.llama_port),
+        llama_rerank_url: format!("http://127.0.0.1:{}", runtime_config.llama_reranker_port),
+        llama_runtime: Arc::new(Mutex::new(LlamaRuntime::new(runtime_config))),
         embedding_cache: Arc::new(RwLock::new(initial_cache)),
         cache_dirty: Arc::new(AtomicBool::new(false)),
         cache_file,
@@ -599,125 +745,171 @@ async fn perform_semantic_search(
     state: &AppState,
     payload: SearchRequest,
 ) -> Result<Vec<SearchResult>, (StatusCode, String)> {
-    let query_vec = get_embedding(state, &payload.query).await?;
+    let runtime_lease = state.acquire_llama_runtime().await?;
+    let result = async {
+        let query_vec = get_embedding(state, &payload.query).await?;
 
-    let mut db = CacheDB::new();
-    let collection_name = "temp_search";
-    db.create_collection(
-        collection_name.to_string(),
-        query_vec.len(),
-        Distance::Cosine,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut db = CacheDB::new();
+        let collection_name = "temp_search";
+        db.create_collection(
+            collection_name.to_string(),
+            query_vec.len(),
+            Distance::Cosine,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut join_set = tokio::task::JoinSet::new();
-    let semaphore = Arc::new(Semaphore::new(32)); // Limit concurrent embedding requests
+        let mut join_set = tokio::task::JoinSet::new();
+        let semaphore = Arc::new(Semaphore::new(32));
 
-    for root in payload.paths {
-        let walker = WalkBuilder::new(root).hidden(true).git_ignore(true).build();
+        for root in payload.paths {
+            let walker = WalkBuilder::new(root).hidden(true).git_ignore(true).build();
 
-        for result in walker {
-            if let Ok(entry) = result {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    let path = entry.path().to_path_buf();
-                    let state = state.clone();
-                    let sem = semaphore.clone();
+            for result in walker {
+                if let Ok(entry) = result {
+                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                        let path = entry.path().to_path_buf();
+                        let state = state.clone();
+                        let sem = semaphore.clone();
 
-                    join_set.spawn(async move {
-                        let content = match tokio::fs::read_to_string(&path).await {
-                            Ok(c) => c,
-                            Err(_) => return Vec::new(),
-                        };
-
-                        let chunks = chunk_text(&content, 4000);
-                        let mut file_embeddings = Vec::new();
-
-                        for chunk in chunks {
-                            let _permit = sem.acquire().await.unwrap();
-                            let vector = match get_embedding(&state, &chunk.content).await {
-                                Ok(v) => v,
-                                Err(_) => continue,
+                        join_set.spawn(async move {
+                            let content = match tokio::fs::read_to_string(&path).await {
+                                Ok(c) => c,
+                                Err(_) => return Vec::new(),
                             };
 
-                            let mut id = HashMap::new();
-                            id.insert("hash".into(), format!("{:x}", md5::compute(&chunk.content)));
+                            let chunks = chunk_text(&content, 4000);
+                            let mut file_embeddings = Vec::new();
 
-                            let mut metadata = HashMap::new();
-                            metadata.insert("content".into(), chunk.content);
-                            metadata.insert("file".into(), path.display().to_string());
-                            metadata.insert("line_start".into(), chunk.line_start.to_string());
-                            metadata.insert("line_end".into(), chunk.line_end.to_string());
+                            for chunk in chunks {
+                                let _permit = sem.acquire().await.unwrap();
+                                let vector = match get_embedding(&state, &chunk.content).await {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
 
-                            file_embeddings.push(Embedding {
-                                id,
-                                vector,
-                                metadata: Some(metadata),
-                            });
-                        }
-                        file_embeddings
-                    });
+                                let mut id = HashMap::new();
+                                id.insert("hash".into(), format!("{:x}", md5::compute(&chunk.content)));
+
+                                let mut metadata = HashMap::new();
+                                metadata.insert("content".into(), chunk.content);
+                                metadata.insert("file".into(), path.display().to_string());
+                                metadata.insert("line_start".into(), chunk.line_start.to_string());
+                                metadata.insert("line_end".into(), chunk.line_end.to_string());
+
+                                file_embeddings.push(Embedding {
+                                    id,
+                                    vector,
+                                    metadata: Some(metadata),
+                                });
+                            }
+                            file_embeddings
+                        });
+                    }
                 }
             }
         }
-    }
 
-    while let Some(res) = join_set.join_next().await {
-        if let Ok(embeddings) = res {
-            for emb in embeddings {
-                let _ = db.insert_into_collection(collection_name, emb);
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(embeddings) = res {
+                for emb in embeddings {
+                    let _ = db.insert_into_collection(collection_name, emb);
+                }
             }
         }
-    }
 
-    let collection = db
-        .get_collection(collection_name)
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB error".into()))?;
+        let collection = db
+            .get_collection(collection_name)
+            .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB error".into()))?;
 
-    let limit = payload.limit.unwrap_or(10);
-    let initial_results = collection.get_similarity(&query_vec, limit * 2);
+        let limit = payload.limit.unwrap_or(10);
+        let initial_results = collection.get_similarity(&query_vec, limit * 2);
 
-    if initial_results.is_empty() {
-        return Ok(vec![]);
-    }
+        if initial_results.is_empty() {
+            return Ok(vec![]);
+        }
 
-    let mut docs_to_rerank = Vec::new();
-    let mut metadata_list = Vec::new();
-    for res in initial_results {
-        let meta = res.embedding.metadata.clone().unwrap_or_default();
-        docs_to_rerank.push(meta.get("content").cloned().unwrap_or_default());
-        metadata_list.push(meta);
-    }
+        let mut docs_to_rerank = Vec::new();
+        let mut metadata_list = Vec::new();
+        for res in initial_results {
+            let meta = res.embedding.metadata.clone().unwrap_or_default();
+            docs_to_rerank.push(meta.get("content").cloned().unwrap_or_default());
+            metadata_list.push(meta);
+        }
 
-    let rerank_body = serde_json::json!({
-        "model": "default",
-        "query": payload.query,
-        "documents": docs_to_rerank
-    });
+        let rerank_body = serde_json::json!({
+            "model": "default",
+            "query": payload.query,
+            "documents": docs_to_rerank
+        });
 
-    let resp = state
-        .client
-        .post(&format!("{}/v1/rerank", state.llama_rerank_url))
-        .json(&rerank_body)
-        .send()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let status = resp.status();
-    if status.is_success() {
-        let json: serde_json::Value = resp
-            .json()
+        let resp = state
+            .client
+            .post(&format!("{}/v1/rerank", state.llama_rerank_url))
+            .json(&rerank_body)
+            .send()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        if let Some(reranked) = json["results"].as_array() {
-            let mut final_results = Vec::new();
-            for item in reranked.iter().take(limit) {
-                let idx = item["index"].as_u64().unwrap() as usize;
-                let score = item["relevance_score"].as_f64().unwrap() as f32;
-                let meta = &metadata_list[idx];
+        let status = resp.status();
+        if status.is_success() {
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-                final_results.push(SearchResult {
-                    content: docs_to_rerank[idx].clone(),
+            if let Some(reranked) = json["results"].as_array() {
+                let mut final_results = Vec::new();
+                for item in reranked.iter().take(limit) {
+                    let idx = item["index"].as_u64().unwrap() as usize;
+                    let score = item["relevance_score"].as_f64().unwrap() as f32;
+                    let meta = &metadata_list[idx];
+
+                    final_results.push(SearchResult {
+                        content: docs_to_rerank[idx].clone(),
+                        file: meta.get("file").cloned().unwrap_or_default(),
+                        line_start: meta
+                            .get("line_start")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                        line_end: meta
+                            .get("line_end")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                        score,
+                    });
+                }
+                Ok(final_results)
+            } else {
+                let final_results = docs_to_rerank
+                    .into_iter()
+                    .zip(metadata_list.into_iter())
+                    .take(limit)
+                    .map(|(content, meta)| SearchResult {
+                        content,
+                        file: meta.get("file").cloned().unwrap_or_default(),
+                        line_start: meta
+                            .get("line_start")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                        line_end: meta
+                            .get("line_end")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0),
+                        score: 0.0,
+                    })
+                    .collect();
+                Ok(final_results)
+            }
+        } else {
+            let error_text = resp.text().await.unwrap_or_default();
+            error!("llama-server rerank error ({}): {}", status, error_text);
+
+            let final_results = docs_to_rerank
+                .into_iter()
+                .zip(metadata_list.into_iter())
+                .take(limit)
+                .map(|(content, meta)| SearchResult {
+                    content,
                     file: meta.get("file").cloned().unwrap_or_default(),
                     line_start: meta
                         .get("line_start")
@@ -727,37 +919,15 @@ async fn perform_semantic_search(
                         .get("line_end")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0),
-                    score,
-                });
-            }
-            return Ok(final_results);
+                    score: 0.0,
+                })
+                .collect();
+            Ok(final_results)
         }
-    } else {
-        let error_text = resp.text().await.unwrap_or_default();
-        error!("llama-server rerank error ({}): {}", status, error_text);
-    }
+    }.await;
 
-    // Fallback to vector search results if rerank fails
-    let final_results = docs_to_rerank
-        .into_iter()
-        .zip(metadata_list.into_iter())
-        .take(limit)
-        .map(|(content, meta)| SearchResult {
-            content,
-            file: meta.get("file").cloned().unwrap_or_default(),
-            line_start: meta
-                .get("line_start")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            line_end: meta
-                .get("line_end")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            score: 0.0,
-        })
-        .collect();
-
-    Ok(final_results)
+    runtime_lease.release().await;
+    result
 }
 
 #[cfg(test)]

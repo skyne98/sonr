@@ -12,7 +12,7 @@
 
 ## Architecture
 
-- **sonr-daemon**: A background service that manages two `llama-server` instances (one for embeddings, one for reranking) and provides a REST API.
+- **sonr-daemon**: A background service that lazily starts two `llama-server` instances per search (one for embeddings, one for reranking), then shuts them down after the request while providing a REST API.
 - **sonr**: A lightweight CLI that sends search queries to the daemon and displays results.
 
 ## Installation
@@ -35,7 +35,7 @@ cargo install sonr sonr-daemon
 sonr-daemon
 ```
 
-The daemon will download the default models (Qwen3-0.6B based) and start listening on an available port. It writes this port to a discovery file so the CLI can find it automatically.
+The daemon will download the default models (Qwen3-0.6B based) and start listening on an available port. `llama-server` helpers are launched lazily for each search and shut down when the request completes. It writes the daemon port to a discovery file so the CLI can find it automatically.
 
 ### 2. Search via CLI
 
@@ -71,7 +71,8 @@ The daemon supports several flags:
 - `--port-file`: Path to write the assigned port for CLI discovery.
 - `--embedding-hf-repo`: HF repository for the embedding model.
 - `--reranker-hf-repo`: HF repository for the reranker model.
-- `--gpu-layers`: Number of layers to offload to GPU (default: 99).
+- `--gpu-layers`: Number of layers to offload to GPU (optional; leave unset to let llama.cpp decide when used with `--fit`).
+- `--fit`: Enable llama.cpp automatic GPU fit for the internal embedding and reranker servers.
 - `--cache-file`: Path to persist the embedding cache.
 
 Run `sonr-daemon --help` for full details.
